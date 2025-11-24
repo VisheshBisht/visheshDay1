@@ -1,0 +1,80 @@
+name: Deploy Azure Infrastructure with Terraform
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+jobs:
+  # ------------------- PLAN JOB -------------------
+  terraform-plan:
+    runs-on: ubuntu-latest
+    steps:
+      # Checkout code
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      # Install Terraform
+      - name: Install Terraform
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget unzip
+          wget https://releases.hashicorp.com/terraform/1.5.7/terraform_1.5.7_linux_amd64.zip
+          unzip terraform_1.5.7_linux_amd64.zip
+          sudo mv terraform /usr/local/bin/
+          terraform -version
+      # Login to Azure (Service Principal via secret)
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      # Terraform Init & Plan at repo root
+      - name: Terraform Init & Plan
+        working-directory: .
+        run: |
+          terraform init -input=false
+          terraform plan -out=tfplan -input=false
+      # Upload Plan Artifact from root
+      - name: Upload Terraform Plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan
+          path: |
+            tfplan
+            .terraform.lock.hcl
+  # ------------------- APPLY JOB -------------------
+  terraform-apply:
+    runs-on: ubuntu-latest
+    needs: terraform-plan
+    steps:
+      # Checkout code
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      # Install Terraform
+      - name: Install Terraform
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget unzip
+          wget https://releases.hashicorp.com/terraform/1.5.7/terraform_1.5.7_linux_amd64.zip
+          unzip terraform_1.5.7_linux_amd64.zip
+          sudo mv terraform /usr/local/bin/
+          terraform -version
+      # Login to Azure
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      # Download Plan Artifact to root
+      - name: Download Terraform Plan
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-plan
+          path: .
+      # Apply Terraform Plan from root
+      - name: Terraform Apply
+        working-directory: .
+        run: |
+          ls -l             # Debug: confirm tfplan exists at root
+          terraform init -input=false   # Restore providers/backend
+          terraform apply -auto-approve tfplan
+ 
+ 
+ 
