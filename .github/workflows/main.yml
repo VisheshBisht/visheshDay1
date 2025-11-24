@@ -1,80 +1,143 @@
+
 name: Deploy Azure Infrastructure with Terraform
+
 on:
   push:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to deploy (dev or prod)"
+        required: true
+        default: "dev"
+
+env:
+  TF_INPUT: false
+  TF_LOG: INFO
+
 jobs:
   # ------------------- PLAN JOB -------------------
   terraform-plan:
     runs-on: ubuntu-latest
+    # Compute environment directory from input; default to dev if push
+    env:
+      ENV_DIR: ${{ github.event_name == 'workflow_dispatch' && format('environments/{0}', inputs.environment) || 'environments/dev' }}
+
     steps:
-      # Checkout code
       - name: Checkout repository
         uses: actions/checkout@v4
-      # Install Terraform
-      - name: Install Terraform
+
+      - name: Show environment directory contents (debug)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y wget unzip
-          wget https://releases.hashicorp.com/terraform/1.5.7/terraform_1.5.7_linux_amd64.zip
-          unzip terraform_1.5.7_linux_amd64.zip
-          sudo mv terraform /usr/local/bin/
-          terraform -version
+          echo "ENV_DIR -> ${{ env.ENV_DIR }}"
+          ls -la "${{ env.ENV_DIR }}"
+
+      # Prefer official action rather than manual install
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
       # Login to Azure (Service Principal via secret)
       - name: Login to Azure
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
-      # Terraform Init & Plan at repo root
-      - name: Terraform Init & Plan
-        working-directory: .
+
+      # If you use ARM_* instead of AZURE_CREDENTIALS, uncomment and use env export:
+      # - name: Export ARM_* env vars
+      #   run: |
+      #     echo "ARM_CLIENT_ID=${{ secrets.ARM_CLIENT_ID }}" >> $GITHUB_ENV
+      #     echo "ARM_CLIENT_SECRET=${{ secrets.ARM_CLIENT_SECRET }}" >> $GITHUB_ENV
+      #     echo "ARM_TENANT_ID=${{ secrets.ARM_TENANT_ID }}" >> $GITHUB_ENV
+      #     echo "ARM_SUBSCRIPTION_ID=${{ secrets.ARM_SUBSCRIPTION_ID }}" >> $GITHUB_ENV
+
+      - name: Terraform fmt (check)
+        working-directory: ${{ env.ENV_DIR }}
+        run: terraform fmt -check -recursive
+
+      # ---------- Choose ONE init: local or remote backend ----------
+      # Local state (simple)
+      - name: Terraform Init (local)
+        working-directory: ${{ env.ENV_DIR }}
+        run: terraform init -input=false
+
+      # Remote state (Azure Storage) - uncomment those lines if you have backend.tf
+      # - name: Terraform Init (remote azurerm backend)
+      #   working-directory: ${{ env.ENV_DIR }}
+      #   run: |
+      #     ENV_NAME=$(basename "${{ env.ENV_DIR }}")
+      #     terraform init -input=false \
+      #       -backend-config="resource_group_name=${{ secrets.STATE_RG }}" \
+      #       -backend-config="storage_account_name=${{ secrets.STATE_STORAGE }}" \
+      #       -backend-config="container_name=${{ secrets.STATE_CONTAINER }}" \
+      #       -backend-config="key=${{ secrets.STATE_KEY_PREFIX }}/${ENV_NAME}.tfstate"
+
+      - name: Terraform Validate
+        working-directory: ${{ env.ENV_DIR }}
+        run: terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: ${{ env.ENV_DIR }}
         run: |
-          terraform init -input=false
-          terraform plan -out=tfplan -input=false
-      # Upload Plan Artifact from root
-      - name: Upload Terraform Plan
+          terraform plan -input=false -var-file="terraform.tfvars" -out=tfplan.out
+          terraform show -no-color tfplan.out > tfplan.txt
+
+      - name: Upload Terraform Plan Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: terraform-plan
+          name: terraform-plan-${{ env.ENV_DIR }}
           path: |
-            tfplan
-            .terraform.lock.hcl
+            ${{ env.ENV_DIR }}/tfplan.out
+            ${{ env.ENV_DIR }}/tfplan.txt
+            ${{ env.ENV_DIR }}/.terraform.lock.hcl
+
   # ------------------- APPLY JOB -------------------
   terraform-apply:
     runs-on: ubuntu-latest
     needs: terraform-plan
+    env:
+      ENV_DIR: ${{ github.event_name == 'workflow_dispatch' && format('environments/{0}', inputs.environment) || 'environments/dev' }}
+    # Auto-apply only on push to main; for manual runs, you can remove this condition
+    if: github.ref == 'refs/heads/main'
+
     steps:
-      # Checkout code
       - name: Checkout repository
         uses: actions/checkout@v4
-      # Install Terraform
-      - name: Install Terraform
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y wget unzip
-          wget https://releases.hashicorp.com/terraform/1.5.7/terraform_1.5.7_linux_amd64.zip
-          unzip terraform_1.5.7_linux_amd64.zip
-          sudo mv terraform /usr/local/bin/
-          terraform -version
-      # Login to Azure
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
       - name: Login to Azure
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
-      # Download Plan Artifact to root
-      - name: Download Terraform Plan
+
+      - name: Download Terraform Plan Artifacts
         uses: actions/download-artifact@v4
         with:
-          name: terraform-plan
-          path: .
-      # Apply Terraform Plan from root
-      - name: Terraform Apply
-        working-directory: .
+          name: terraform-plan-${{ env.ENV_DIR }}
+          path: ${{ env.ENV_DIR }}
+
+      - name: List downloaded artifacts (debug)
         run: |
-          ls -l             # Debug: confirm tfplan exists at root
-          terraform init -input=false   # Restore providers/backend
-          terraform apply -auto-approve tfplan
- 
- 
- 
+          ls -la "${{ env.ENV_DIR }}"
+
+      - name: Terraform Init (same as plan)
+        working-directory: ${{ env.ENV_DIR }}
+        run: terraform init -input=false
+
+      - name: Terraform Apply from saved plan
+        working-directory: ${{ env.ENV_DIR }}
+        run: |
+          terraform apply -input=false -auto-approve tfplan.out | tee apply.log
+
+      - name: Upload Apply Logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-apply-logs-${{ env.ENV_DIR }}
+          path: ${{ env.ENV_DIR }}/apply.log
